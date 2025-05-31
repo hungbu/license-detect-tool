@@ -1,11 +1,13 @@
-from fastapi import FastAPI, Form
+import threading
+import json
+import time
+from fastapi import FastAPI
 from pydantic import BaseModel
 import cv2
 import torch
 import function.utils_rotate as utils_rotate
 import function.helper as helper
 import requests
-import time
 
 app = FastAPI()
 
@@ -14,11 +16,40 @@ yolo_LP_detect = torch.hub.load('yolov5', 'custom', path='model/LP_detector_nano
 yolo_license_plate = torch.hub.load('yolov5', 'custom', path='model/LP_ocr_nano_62.pt', force_reload=True, source='local')
 yolo_license_plate.conf = 0.60
 
-class DetectRequest(BaseModel):
-    video_path: str
-    result_api: str
+destinationResult = "http://your-other-api/receive"
+CAMERA_CONFIG_FILE = "cameras.json"
+camera_list_lock = threading.Lock()
+camera_list = []
 
-def detect_license(video_path):
+def load_camera_list():
+    global camera_list
+    with camera_list_lock:
+        try:
+            with open(CAMERA_CONFIG_FILE, "r") as f:
+                camera_list = json.load(f)
+        except Exception:
+            camera_list = []
+
+def save_camera_list():
+    with camera_list_lock:
+        with open(CAMERA_CONFIG_FILE, "w") as f:
+            json.dump(camera_list, f, indent=2)
+
+# Load camera list at startup
+load_camera_list()
+
+class CameraConfig(BaseModel):
+    video_path: str
+    laneId: int
+
+def send_plate_to_api(laneId, plate):
+    try:
+        resp = requests.post(destinationResult, json={"plate": plate, "timestamp": time.time(), "laneId": laneId})
+        return {"plate": plate, "sent_status": resp.status_code}
+    except Exception as e:
+        return {"plate": plate, "error": str(e)}
+
+def detect_license(video_path, laneId):
     vid = cv2.VideoCapture(video_path)
     results = set()
     while True:
@@ -38,30 +69,43 @@ def detect_license(video_path):
                 for ct in range(0,2):
                     lp = helper.read_plate(yolo_license_plate, utils_rotate.deskew(crop_img, cc, ct))
                     if lp != "unknown":
-                        results.add(lp)
+                        if lp not in results:
+                            results.add(lp)
+                            send_plate_to_api(laneId, lp)
                         break
                 if lp != "unknown":
                     break
     vid.release()
     return list(results)
 
-@app.post("/detect")
-def detect_api(req: DetectRequest):
-    plates = detect_license(req.video_path)
-    # Send result to another API
-    try:
-        resp = requests.post(req.result_api, json={"plates": plates})
-        return {"plates": plates, "sent_status": resp.status_code}
-    except Exception as e:
-        return {"plates": plates, "error": str(e)}
+def camera_worker(camera):
+    while True:
+        detect_license(camera["video_path"], camera["laneId"])
+        time.sleep(1)  # Adjust as needed
 
-# To run: uvicorn api:app --reload
-# Start server:
-# uvicorn api:app --reload
-# POST to /detect with JSON:
+def start_all_cameras():
+    load_camera_list()
+    for camera in camera_list:
+        t = threading.Thread(target=camera_worker, args=(camera,), daemon=True) 
+        t.start()
 
-#**
-# {
-#   "video_path": "0310.mp4",
-#   "result_api": "http://your-other-api/receive"
-# }
+@app.post("/add_camera")
+def add_camera(camera: CameraConfig):
+    load_camera_list()
+    with camera_list_lock:
+        camera_list.append({"video_path": camera.video_path, "laneId": camera.laneId})
+        save_camera_list()
+    # Start a new thread for this camera
+    t = threading.Thread(target=camera_worker, args=({"video_path": camera.video_path, "laneId": camera.laneId},), daemon=True)
+    t.start()
+    return {"status": "added", "camera": camera}
+
+@app.get("/cameras")
+def get_cameras():
+    load_camera_list()
+    return {"cameras": camera_list}
+
+# Start all camera threads when app starts
+@app.on_event("startup")
+def on_startup():
+    start_all_cameras()

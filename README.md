@@ -30,11 +30,6 @@ This repository provides you with a detailed guide on how to training and build 
   # run LP_recognition.ipynb if you want to know how model work in each step
 ```
 
-## Result
-![Demo 1](result/image.jpg)
-
-![Vid](result/video_1.gif)
-
 ## Vietnamese Plate Dataset
 
 This repo uses 2 sets of data for 2 stage of license plate recognition problem:
